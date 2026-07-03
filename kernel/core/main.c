@@ -6,13 +6,17 @@
 #include "../fs/procfs.h"
 #include "../fs/ext2.h"
 #include "../syscall/syscall.h"
+#include "../proc/init.h"
 #include "../../arch/x86_64/gdt.h"
 #include "../../arch/x86_64/idt.h"
 #include "../../arch/x86_64/pic.h"
 #include "../../arch/x86_64/pit.h"
 #include "../../drivers/tty.h"
 #include "../../drivers/ata.h"
+#include "../../drivers/fb.h"
+#include "../../drivers/bga.h"
 #include "../../drivers/keyboard.h"
+#include "../../drivers/serial.h"
 #include "../../lib/printk.h"
 #include "../../lib/string.h"
 #include "../../mm/pmm.h"
@@ -226,7 +230,7 @@ shell(void)
             printk("  up %u.%03u seconds\n",ms/1000,ms%1000);
         }
         else if(!kstrcmp(cmd,"uname"))  printk("Sinux 0.04\n");
-        else if(!kstrcmp(cmd,"clear"))  { extern void vga_clear(void); vga_clear(); }
+        else if(!kstrcmp(cmd,"clear"))  { tty_clear(); }
         else if(!kstrcmp(cmd,"halt"))   {
             tty_setcolor_err(); tty_puts("Halting...\n");
             __asm__ volatile("cli"); for(;;) __asm__ volatile("hlt");
@@ -245,7 +249,18 @@ kernel_main(uint32_t mb2_magic, uint64_t mb2_info)
     g_mb2_magic = mb2_magic;
     g_mb2_info  = mb2_info;
 
-    tty_init();
+    /*
+     * مرحله ۱: فقط serial رو init کن.
+     * تا وقتی fb map نشده، هیچ چیزی به framebuffer نمی‌نویسیم.
+     * printk از این لحظه فقط روی serial کار می‌کنه.
+     */
+    serial_init();
+
+    /*
+     * مرحله ۲: زیرساخت اصلی CPU و حافظه
+     * ترتیب اینجا مهمه — IDT باید قبل از هر چیزی باشه
+     * که ممکنه fault بده (از جمله vmm و bga).
+     */
     gdt_init();
     idt_init();
     pic_init();
@@ -253,9 +268,47 @@ kernel_main(uint32_t mb2_magic, uint64_t mb2_info)
     keyboard_init();
     pmm_init(mb2_magic, mb2_info);
     vmm_init();
+
+    /*
+     * مرحله ۳: گرافیک
+     *
+     * حالا IDT و VMM آماده‌ان — می‌تونیم BGA رو روشن کنیم.
+     *
+     * چرا ترتیب اینجا مهمه؟
+     *   bga_init() فقط رجیسترهای دستگاه رو ست می‌کنه و آدرس واقعی
+     *   framebuffer رو از PCI config space (BAR0) کشف می‌کنه —
+     *   خودش هنوز به حافظه چیزی نمی‌نویسه، پس صدا زدنش قبل از
+     *   map کردن مشکلی نداره. اما fb_init() اولین کسیه که واقعاً
+     *   می‌نویسه، پس باید حتماً بعد از vmm_map_range بیاد.
+     *
+     * ترتیب صحیح:
+     *   1) bga_init       — کارت رو روشن کن، آدرس واقعی رو از PCI بگیر
+     *   2) vmm_map_range  — همون آدرس واقعی رو map کن
+     *   3) fb_init        — حالا امنه که بنویسیم؛ صفحه رو پاک کن
+     *   4) tty_init       — حالا tty می‌تونه از fb استفاده کنه
+     */
+    if (bga_init(1024, 768, 32) == 0) {
+        uint64_t fb_phys = bga_fb_phys_addr();
+
+        vmm_map_range(vmm_kernel_pml4(),
+                      fb_phys,         /* virt — همون phys (identity) */
+                      fb_phys,         /* phys — آدرس واقعی از PCI BAR0 */
+                      1024 * 768 * 4,  /* bytes: width * height * (bpp/8) */
+                      VMM_PRESENT | VMM_WRITABLE);
+
+        fb_init();   /* صفحه رو سیاه کن، cursor = (0,0) */
+    }
+
+    /* حالا tty می‌تونه از fb_putc استفاده کنه */
+    tty_init();
+
+    /*
+     * مرحله ۴: بقیه سابسیستم‌ها
+     */
     vfs_init();
     ramfs_mount("/");
     procfs_mount("/proc");
+    tty_dev_init();
     proc_init();
     sched_init();
     syscall_init();
@@ -284,15 +337,25 @@ kernel_main(uint32_t mb2_magic, uint64_t mb2_info)
     __asm__ volatile("sti");
 
     tty_setcolor_info();
-    tty_puts("#############################################\n"
-             "#                   Sinux                   #\n"
-             "#     Made By SUN (Sinux Users Network)     #\n"
-             "#############################################\n");
+    tty_puts("############################################\n"
+             "#                  Sinux                  #\n"
+             "#    Made By SUN (Sinux Users Network)    #\n"
+             "############################################\n");
     tty_setcolor_reset();
 
-    uint64_t fr=(uint64_t)pmm_free_pages() *PAGE_SIZE/(1024*1024);
-    uint64_t to=(uint64_t)pmm_total_pages()*PAGE_SIZE/(1024*1024);
-    printk(KERN_INFO "RAM: %u/%u MiB  |  Type 'help'\n\n", fr, to);
+    uint64_t fr = (uint64_t)pmm_free_pages()  * PAGE_SIZE / (1024*1024);
+    uint64_t to = (uint64_t)pmm_total_pages() * PAGE_SIZE / (1024*1024);
+    printk(KERN_INFO "RAM: %u/%u MiB\n\n", fr, to);
 
+    if (proc_spawn_init() == 0) {
+        printk(KERN_INFO
+               "kernel: idle — init will run on next scheduler tick\n");
+        for (;;)
+            __asm__ volatile("hlt");
+    }
+
+    printk(KERN_WARNING
+           "kernel: no init binary — falling back to kernel shell\n"
+           "        (place ELF at /sbin/init or /bin/init)\n\n");
     shell();
 }

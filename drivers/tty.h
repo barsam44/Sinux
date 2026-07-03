@@ -3,7 +3,11 @@
 void tty_init(void);
 void tty_putc(char c);
 void tty_puts(const char *s);
+void tty_clear(void);
 void tty_setcolor_info(void);
 void tty_setcolor_err(void);
 void tty_setcolor_ok(void);
 void tty_setcolor_reset(void);
+
+/* TTY character device — call after ramfs_mount() */
+void tty_dev_init(void);
