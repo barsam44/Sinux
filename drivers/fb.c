@@ -151,7 +151,7 @@ static const uint8_t font8x16[][16] = {
 /* ── text cursor ────────────────────────────────────────── */
 static uint32_t cur_x  = 0;
 static uint32_t cur_y  = 0;
-static uint32_t col_fg = FB_WHITE;
+static uint32_t col_fg = FB_PINK;
 static uint32_t col_bg = FB_BLACK;
 
 void fb_set_fg(uint32_t rgb) { col_fg = rgb; }
